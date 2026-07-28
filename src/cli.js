@@ -15,7 +15,7 @@
  * Minimal CLI entrypoint.
  *
  * Commands:
- *   da-auth-helper login    — obtain / refresh a token and print it to stdout
+ *   da-auth-helper login    — alias for token
  *   da-auth-helper logout   — clear the cached token
  *   da-auth-helper token    — print the current token (login if needed)
  */
