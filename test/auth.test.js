@@ -266,6 +266,23 @@ describe('getValidToken — /callback HTML', () => {
     expect(callbackRes.statusCode).toBe(200);
   });
 
+  test('/callback failure branch uses a safe textContent sink, not innerHTML', async () => {
+    mockFs.pathExists.mockResolvedValue(false);
+    let callbackRes;
+    mockOpen.mockImplementationOnce(async () => {
+      callbackRes = makeRes();
+      capturedRequestHandler(makeReq('/callback'), callbackRes);
+      // Deliberately do NOT call /token — let the timeout reject
+    });
+
+    await getValidToken({ log: () => {}, timeoutMs: 50 }).catch(() => {});
+
+    expect(callbackRes.statusCode).toBe(200);
+    // The attacker-controlled `error` must never be written via innerHTML.
+    expect(callbackRes.body).not.toContain('innerHTML');
+    expect(callbackRes.body).toContain('textContent');
+  });
+
   test('unknown paths return 404', async () => {
     mockFs.pathExists.mockResolvedValue(false);
     let unknownRes;
