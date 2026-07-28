@@ -24,6 +24,7 @@
 import http from 'http';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import fse from 'fs-extra';
 import open from 'open';
 
@@ -86,9 +87,10 @@ function isTokenExpired(stored) {
  *
  * @param {object} [opts]
  * @param {number} [opts.timeoutMs=300000] - How long to wait before giving up (ms).
+ * @param {string} [opts.expectedState] - CSRF nonce that the IMS callback must echo back.
  * @returns {Promise<{token: string, expiresIn: number|null}>}
  */
-function waitForToken({ timeoutMs = 5 * 60 * 1000 } = {}) {
+function waitForToken({ timeoutMs = 5 * 60 * 1000, expectedState } = {}) {
   return new Promise((resolve, reject) => {
     let timeout;
 
@@ -108,10 +110,13 @@ function waitForToken({ timeoutMs = 5 * 60 * 1000 } = {}) {
   const token = p.get('access_token');
   const expiresIn = p.get('expires_in');
   const error = p.get('error');
+  const state = p.get('state');
+  const stateParam = state ? '&state=' + encodeURIComponent(state) : '';
   const dest = token
     ? '/token?access_token=' + encodeURIComponent(token)
       + (expiresIn ? '&expires_in=' + encodeURIComponent(expiresIn) : '')
-    : '/token?error=' + encodeURIComponent(error || 'unknown');
+      + stateParam
+    : '/token?error=' + encodeURIComponent(error || 'unknown') + stateParam;
   fetch(dest).finally(() => {
     if (token) {
       window.location.href = 'https://tools.aem.live/cli/logged-in';
@@ -127,6 +132,15 @@ function waitForToken({ timeoutMs = 5 * 60 * 1000 } = {}) {
 
       // Step 2 — The page above GETs /token with the access_token query-param.
       if (url.pathname === '/token') {
+        // Reject forged callbacks that do not carry the CSRF state nonce we
+        // generated for this login. Ignore them without tearing down the
+        // server so the genuine IMS callback can still complete.
+        const returnedState = url.searchParams.get('state');
+        if (!returnedState || returnedState !== expectedState) {
+          res.writeHead(403);
+          res.end();
+          return;
+        }
         const token = url.searchParams.get('access_token');
         const expiresIn = url.searchParams.get('expires_in');
         const error = url.searchParams.get('error');
@@ -169,11 +183,13 @@ function waitForToken({ timeoutMs = 5 * 60 * 1000 } = {}) {
  * @returns {Promise<string>} access token
  */
 async function login({ log = console.info, timeoutMs } = {}) {
+  const state = crypto.randomBytes(16).toString('hex');
   const params = new URLSearchParams({
     response_type: 'token',
     client_id: CLIENT_ID,
     scope: SCOPE,
     redirect_uri: REDIRECT_URI,
+    state,
   });
   const authUrl = `${IMS_ORIGIN}/ims/authorize/v2?${params}`;
 
@@ -183,7 +199,7 @@ async function login({ log = console.info, timeoutMs } = {}) {
 
   // Start the callback server BEFORE opening the browser so the redirect
   // never races against server startup.
-  const tokenPromise = waitForToken({ timeoutMs });
+  const tokenPromise = waitForToken({ timeoutMs, expectedState: state });
   await open(authUrl);
 
   const { token, expiresIn } = await tokenPromise;
