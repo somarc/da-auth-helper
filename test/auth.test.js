@@ -57,17 +57,26 @@ function makeRes() {
 }
 
 /**
+ * Reads the state nonce out of the authorize URL handed to the mocked `open`.
+ */
+function currentState() {
+  const calls = mockOpen.mock.calls;
+  const [authUrl] = calls[calls.length - 1];
+  return new URL(authUrl).searchParams.get('state');
+}
+
+/**
  * Simulates a browser completing the OAuth callback:
  *   1. GET /callback  — server responds with the HTML redirect page
  *   2. GET /token     — page JS calls this with the access_token
  */
-function simulateBrowserCallback(token, expiresIn = 3600) {
+function simulateBrowserCallback(token, expiresIn = 3600, state = currentState()) {
   // Hit /callback
   capturedRequestHandler(makeReq('/callback'), makeRes());
   // Hit /token
   const tokenRes = makeRes();
   capturedRequestHandler(
-    makeReq('/token', { access_token: token, expires_in: String(expiresIn) }),
+    makeReq('/token', { access_token: token, expires_in: String(expiresIn), state }),
     tokenRes,
   );
   return tokenRes;
@@ -184,10 +193,42 @@ describe('getValidToken — browser login flow', () => {
 
     mockOpen.mockImplementationOnce(async () => {
       capturedRequestHandler(makeReq('/callback'), makeRes());
-      capturedRequestHandler(makeReq('/token', { error: 'access_denied' }), makeRes());
+      capturedRequestHandler(
+        makeReq('/token', { error: 'access_denied', state: currentState() }),
+        makeRes(),
+      );
     });
 
     await expect(getValidToken({ log: () => {} })).rejects.toThrow('access_denied');
+  });
+
+  test('includes a state (CSRF nonce) in the authorize URL', async () => {
+    mockFs.pathExists.mockResolvedValue(false);
+    mockOpen.mockImplementationOnce(async () => { simulateBrowserCallback('T'); });
+
+    await getValidToken({ log: () => {} });
+
+    const [url] = mockOpen.mock.calls[0];
+    expect(new URL(url).searchParams.get('state')).toMatch(/^[a-f0-9]{32}$/);
+  });
+
+  test('ignores a /token callback with a mismatched state (fixation attempt)', async () => {
+    mockFs.pathExists.mockResolvedValue(false);
+    mockOpen.mockImplementationOnce(async () => {
+      const attackerRes = makeRes();
+      capturedRequestHandler(
+        makeReq('/token', { access_token: 'ATTACKER_TOKEN', state: 'WRONG' }),
+        attackerRes,
+      );
+      expect(attackerRes.statusCode).toBe(403);
+      // Server still listening, so the genuine callback completes.
+      simulateBrowserCallback('GENUINE_TOKEN');
+    });
+
+    const token = await getValidToken({ log: () => {} });
+
+    expect(token).toBe('GENUINE_TOKEN');
+    expect(mockFs.writeJson.mock.calls[0][1].access_token).toBe('GENUINE_TOKEN');
   });
 });
 
