@@ -121,7 +121,11 @@ function waitForToken({ timeoutMs = 5 * 60 * 1000, expectedState } = {}) {
     if (token) {
       window.location.href = 'https://tools.aem.live/cli/logged-in';
     } else {
-      document.body.innerHTML = '<h2>Login failed.</h2><p>' + (error || 'Unknown error') + '</p>';
+      const heading = document.createElement('h2');
+      heading.textContent = 'Login failed.';
+      const detail = document.createElement('p');
+      detail.textContent = error || 'Unknown error';
+      document.body.replaceChildren(heading, detail);
     }
   });
 </script>
