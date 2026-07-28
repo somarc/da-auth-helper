@@ -10,6 +10,8 @@ Designed to be used by any LLM agent, CLI tool, or Node.js application that need
 2. If none, starts a local HTTP server on port **9898**, opens the IMS login page in the user's default browser, waits for the OAuth callback, persists the token, and shuts down.
 3. Returns the token string.
 
+IMS issues tokens with a 24-hour lifetime.
+
 ## Run
 
 Run directly without installing:
@@ -57,11 +59,17 @@ Returns `Promise<void>`.
 # Print token to stdout (login if needed)
 da-auth-helper token
 
-# Same as token — explicitly trigger/refresh login
+# Alias for token
 da-auth-helper login
 
 # Clear cached token
 da-auth-helper logout
+```
+
+`login` is an alias for `token`. Both return the cached token while it is valid, so neither triggers a new login. To force one, clear the cache first:
+
+```bash
+da-auth-helper logout && da-auth-helper token
 ```
 
 Token is printed to **stdout**; status messages go to **stderr**, so shell pipelines work cleanly:
