@@ -1,18 +1,18 @@
 import { EventEmitter } from 'events';
 import { jest } from '@jest/globals';
-import os from 'os';
-import path from 'path';
 
-// ─── Mock fs-extra ────────────────────────────────────────────────────────────
+// ─── Mock credential storage ─────────────────────────────────────────────────
 
-const mockFs = {
-  pathExists: jest.fn(),
-  readJson: jest.fn(),
-  writeJson: jest.fn(),
-  ensureDir: jest.fn(),
-  remove: jest.fn(),
-};
-jest.unstable_mockModule('fs-extra', () => ({ default: mockFs, ...mockFs }));
+const TOKEN_FILE = '/mock-home/.aem/da-token.json';
+const mockLoadStoredToken = jest.fn();
+const mockStoreToken = jest.fn();
+const mockClearStoredToken = jest.fn();
+jest.unstable_mockModule('../src/storage.js', () => ({
+  TOKEN_FILE,
+  loadStoredToken: mockLoadStoredToken,
+  storeToken: mockStoreToken,
+  clearStoredToken: mockClearStoredToken,
+}));
 
 // ─── Mock open ────────────────────────────────────────────────────────────────
 
@@ -72,7 +72,6 @@ jest.unstable_mockModule('http', () => ({ default: { createServer: mockHttpCreat
 
 // ─── Import SUT after mocks ───────────────────────────────────────────────────
 
-const TOKEN_FILE = path.join(os.homedir(), '.aem', 'da-token.json');
 const {
   AUTH_EVENT_SCHEMA,
   AuthError,
@@ -174,11 +173,9 @@ beforeEach(() => {
   capturedRequestHandler = undefined;
   currentServer = undefined;
   listenError = undefined;
-  mockFs.pathExists.mockResolvedValue(false);
-  mockFs.readJson.mockResolvedValue(undefined);
-  mockFs.ensureDir.mockResolvedValue(undefined);
-  mockFs.writeJson.mockResolvedValue(undefined);
-  mockFs.remove.mockResolvedValue(undefined);
+  mockLoadStoredToken.mockResolvedValue(null);
+  mockStoreToken.mockResolvedValue(undefined);
+  mockClearStoredToken.mockResolvedValue(undefined);
   mockOpen.mockResolvedValue(undefined);
 });
 
@@ -194,15 +191,14 @@ describe('public compatibility surface', () => {
   test('returns an override without touching cache, listener, events, or browser', async () => {
     const onEvent = jest.fn();
     await expect(getValidToken({ override: 'OVERRIDE', onEvent })).resolves.toBe('OVERRIDE');
-    expect(mockFs.pathExists).not.toHaveBeenCalled();
+    expect(mockLoadStoredToken).not.toHaveBeenCalled();
     expect(mockHttpCreate).not.toHaveBeenCalled();
     expect(mockOpen).not.toHaveBeenCalled();
     expect(onEvent).not.toHaveBeenCalled();
   });
 
   test('returns a valid cached token without starting an attempt', async () => {
-    mockFs.pathExists.mockResolvedValue(true);
-    mockFs.readJson.mockResolvedValue({
+    mockLoadStoredToken.mockResolvedValue({
       access_token: 'CACHED',
       expires_at: Date.now() + 61_000,
     });
@@ -215,8 +211,7 @@ describe('public compatibility surface', () => {
   test('treats the exact 60-second skew boundary as expired', async () => {
     const now = Date.now();
     jest.spyOn(Date, 'now').mockReturnValue(now);
-    mockFs.pathExists.mockResolvedValue(true);
-    mockFs.readJson.mockResolvedValue({ access_token: 'OLD', expires_at: now + 60_000 });
+    mockLoadStoredToken.mockResolvedValue({ access_token: 'OLD', expires_at: now + 60_000 });
     completeFromOpen('FRESH');
 
     await expect(getValidToken({ log: () => {} })).resolves.toBe('FRESH');
@@ -225,8 +220,7 @@ describe('public compatibility surface', () => {
   });
 
   test('treats a legacy cache entry without expires_at as expired', async () => {
-    mockFs.pathExists.mockResolvedValue(true);
-    mockFs.readJson.mockResolvedValue({ access_token: 'LEGACY' });
+    mockLoadStoredToken.mockResolvedValue({ access_token: 'LEGACY' });
     completeFromOpen('FRESH');
 
     await expect(getValidToken({ log: () => {} })).resolves.toBe('FRESH');
@@ -241,11 +235,9 @@ describe('caller-owned acquireToken contract', () => {
 
     expect(currentServer.listen).toHaveBeenCalledWith(9898, 'localhost', expect.any(Function));
     expect(mockOpen).not.toHaveBeenCalled();
-    expect(mockFs.pathExists).not.toHaveBeenCalled();
-    expect(mockFs.readJson).not.toHaveBeenCalled();
-    expect(mockFs.ensureDir).not.toHaveBeenCalled();
-    expect(mockFs.writeJson).not.toHaveBeenCalled();
-    expect(mockFs.remove).not.toHaveBeenCalled();
+    expect(mockLoadStoredToken).not.toHaveBeenCalled();
+    expect(mockStoreToken).not.toHaveBeenCalled();
+    expect(mockClearStoredToken).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       token: 'CALLER_OWNED',
       tokenAcquired: true,
@@ -291,8 +283,7 @@ describe('caller-owned acquireToken contract', () => {
   });
 
   test('reauthenticating getValidToken bypasses a valid cache and atomically reaches persistence', async () => {
-    mockFs.pathExists.mockResolvedValue(true);
-    mockFs.readJson.mockResolvedValue({
+    mockLoadStoredToken.mockResolvedValue({
       access_token: 'CACHED',
       expires_at: Date.now() + 60 * 60 * 1000,
     });
@@ -300,13 +291,10 @@ describe('caller-owned acquireToken contract', () => {
 
     await expect(getValidToken({ reauthenticate: true, log: () => {} })).resolves.toBe('FRESH');
 
-    expect(mockFs.pathExists).not.toHaveBeenCalled();
-    expect(mockFs.readJson).not.toHaveBeenCalled();
+    expect(mockLoadStoredToken).not.toHaveBeenCalled();
     expect(new URL(mockOpen.mock.calls[0][0]).searchParams.get('prompt')).toBe('login');
-    expect(mockFs.writeJson).toHaveBeenCalledWith(
-      TOKEN_FILE,
+    expect(mockStoreToken).toHaveBeenCalledWith(
       expect.objectContaining({ access_token: 'FRESH' }),
-      { spaces: 2 },
     );
   });
 
@@ -483,7 +471,7 @@ describe('attempt lifecycle and typed failures', () => {
     })).rejects.toMatchObject({ code: 'AUTH_CANCELLED', name: 'AbortError' });
     expect(currentServer.close).toHaveBeenCalledTimes(1);
     expect(currentServer.closeAllConnections).toHaveBeenCalledTimes(1);
-    expect(mockFs.writeJson).not.toHaveBeenCalled();
+    expect(mockStoreToken).not.toHaveBeenCalled();
   });
 
   test('times out deterministically and closes the listener', async () => {
@@ -555,14 +543,11 @@ describe('legacy persistence and logout', () => {
     });
 
     expect(token).toBe('SAVED_TOKEN');
-    expect(mockFs.ensureDir).toHaveBeenCalledWith(path.dirname(TOKEN_FILE));
-    expect(mockFs.writeJson).toHaveBeenCalledWith(
-      TOKEN_FILE,
+    expect(mockStoreToken).toHaveBeenCalledWith(
       expect.objectContaining({
         access_token: 'SAVED_TOKEN',
         expires_at: expect.any(Number),
       }),
-      { spaces: 2 },
     );
     expect(events.at(-1)).toMatchObject({ event: 'completed', persisted: true });
     expect(JSON.stringify(events)).not.toContain('SAVED_TOKEN');
@@ -570,7 +555,7 @@ describe('legacy persistence and logout', () => {
 
   test('maps storage failure without leaking nested filesystem details', async () => {
     completeFromOpen('TOKEN');
-    mockFs.writeJson.mockRejectedValueOnce(new Error('/private/path detail'));
+    mockStoreToken.mockRejectedValueOnce(new Error('/private/path detail'));
     await expect(getValidToken({ log: () => {} })).rejects.toMatchObject({
       code: 'STORE_FAILED',
       message: 'The acquired token could not be stored.',
@@ -578,14 +563,12 @@ describe('legacy persistence and logout', () => {
   });
 
   test('removes the token file when it exists', async () => {
-    mockFs.pathExists.mockResolvedValue(true);
     await clearStoredToken();
-    expect(mockFs.remove).toHaveBeenCalledWith(TOKEN_FILE);
+    expect(mockClearStoredToken).toHaveBeenCalledTimes(1);
   });
 
-  test('does nothing when the token file does not exist', async () => {
-    mockFs.pathExists.mockResolvedValue(false);
+  test('delegates cache absence handling to the secure storage module', async () => {
     await clearStoredToken();
-    expect(mockFs.remove).not.toHaveBeenCalled();
+    expect(mockClearStoredToken).toHaveBeenCalledTimes(1);
   });
 });

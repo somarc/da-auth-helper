@@ -15,10 +15,17 @@
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
   "private": true,
-  "keywords": ["adobe", "da", "da.live", "ims", "auth", "oauth", "mcp"],
+  "keywords": [
+    "adobe",
+    "da",
+    "da.live",
+    "ims",
+    "auth",
+    "oauth",
+    "mcp"
+  ],
   "license": "Apache-2.0",
   "dependencies": {
-    "fs-extra": "^11.2.0",
     "open": "^10.1.0"
   },
   "devDependencies": {
