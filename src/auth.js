@@ -18,11 +18,14 @@
  */
 
 import http from 'http';
-import os from 'os';
-import path from 'path';
 import crypto from 'crypto';
-import fse from 'fs-extra';
 import open from 'open';
+import {
+  TOKEN_FILE,
+  clearStoredToken as clearTokenFile,
+  loadStoredToken,
+  storeToken,
+} from './storage.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -43,7 +46,6 @@ const SCOPE = [
 ].join(',');
 const CALLBACK_PORT = 9898;
 const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`;
-const TOKEN_FILE = path.join(os.homedir(), '.aem', 'da-token.json');
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
 const HEARTBEAT_MS = 15 * 1000;
@@ -128,22 +130,6 @@ function logMessage(log, message) {
   } catch (cause) {
     throw new AuthError('OUTPUT_FAILED', 'Authentication status output failed.', { cause });
   }
-}
-
-// ─── Token storage ───────────────────────────────────────────────────────────
-
-async function loadStoredToken() {
-  if (!await fse.pathExists(TOKEN_FILE)) return null;
-  try {
-    return await fse.readJson(TOKEN_FILE);
-  } catch {
-    return null;
-  }
-}
-
-async function storeToken(tokenData) {
-  await fse.ensureDir(path.dirname(TOKEN_FILE));
-  await fse.writeJson(TOKEN_FILE, tokenData, { spaces: 2 });
 }
 
 // ─── Token validity and metadata ─────────────────────────────────────────────
@@ -699,7 +685,14 @@ export async function getValidToken({
   });
 
   if (!reauthenticate) {
-    const stored = await loadStoredToken();
+    let stored;
+    try {
+      stored = await loadStoredToken();
+    } catch (cause) {
+      throw new AuthError('STORE_FAILED', 'The credential cache could not be read safely.', {
+        cause,
+      });
+    }
     if (stored?.access_token && !isTokenExpired(stored)) {
       return stored.access_token;
     }
@@ -730,7 +723,11 @@ export async function getValidToken({
  * @returns {Promise<void>}
  */
 export async function clearStoredToken() {
-  if (await fse.pathExists(TOKEN_FILE)) {
-    await fse.remove(TOKEN_FILE);
+  try {
+    await clearTokenFile();
+  } catch (cause) {
+    throw new AuthError('STORE_FAILED', 'The credential cache could not be cleared safely.', {
+      cause,
+    });
   }
 }
