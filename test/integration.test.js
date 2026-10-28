@@ -2,8 +2,35 @@ import {
   AUTH_EVENT_SCHEMA,
   acquireToken,
 } from '../src/auth.js';
+import fs from 'fs/promises';
+import net from 'net';
+import os from 'os';
+import path from 'path';
 
 const CALLBACK_ORIGIN = 'http://localhost:9898';
+const LOCK_FILE = path.join(os.tmpdir(), 'da-auth-helper-integration-9898.lock');
+let lockHandle;
+
+async function acquireIntegrationLock() {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      lockHandle = await fs.open(LOCK_FILE, 'wx', 0o600);
+      await lockHandle.writeFile(`${process.pid}\n`);
+      return;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      try {
+        const stats = await fs.stat(LOCK_FILE);
+        if (Date.now() - stats.mtimeMs > 30_000) await fs.unlink(LOCK_FILE);
+      } catch (statError) {
+        if (statError?.code !== 'ENOENT') throw statError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50 + Math.floor(Math.random() * 50)));
+    }
+  }
+  throw new Error('Timed out waiting for the callback integration-test lock.');
+}
 
 function form(params) {
   return {
@@ -13,7 +40,34 @@ function form(params) {
   };
 }
 
+async function loopbackBindError(host) {
+  const server = net.createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(9898, host, resolve);
+    });
+    return null;
+  } catch (error) {
+    return error?.code;
+  } finally {
+    await new Promise((resolve) => {
+      if (!server.listening) resolve();
+      else server.close(resolve);
+    });
+  }
+}
+
 describe('real localhost callback lifecycle', () => {
+  beforeAll(async () => {
+    await acquireIntegrationLock();
+  });
+
+  afterAll(async () => {
+    await lockHandle?.close();
+    await fs.unlink(LOCK_FILE).catch(() => {});
+  });
+
   test('binds, rejects the wrong state, accepts a POST candidate, and releases the port', async () => {
     const events = [];
     let callbackHeaders;
@@ -31,6 +85,10 @@ describe('real localhost callback lifecycle', () => {
         callbackHeaders = callback.headers;
         const html = await callback.text();
         expect(html).toContain("method: 'POST'");
+
+        expect(['EADDRINUSE', 'EAFNOSUPPORT', 'EADDRNOTAVAIL'])
+          .toContain(await loopbackBindError('::1'));
+        expect(await loopbackBindError('127.0.0.1')).toBe('EADDRINUSE');
 
         const rejected = await fetch(`${CALLBACK_ORIGIN}/token`, form({
           access_token: 'IGNORED_CANDIDATE',

@@ -7,6 +7,10 @@
   "exports": {
     ".": "./src/auth.js"
   },
+  "files": [
+    "src",
+    "README.md"
+  ],
   "bin": {
     "da-auth-helper": "./src/cli.js"
   },
