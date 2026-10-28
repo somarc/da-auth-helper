@@ -47,12 +47,11 @@ const SCOPE = [
 const CALLBACK_PORT = 9898;
 const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
-const MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
 const HEARTBEAT_MS = 15 * 1000;
 const MAX_CALLBACK_BODY_BYTES = 64 * 1024;
 const MAX_TOKEN_BYTES = 64 * 1024;
 const MAX_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_EXPIRY_SECONDS = MAX_EXPIRY_MS / 1000;
 
 export const AUTH_EVENT_SCHEMA = 'da-auth-helper.event.v1';
 
@@ -113,14 +112,22 @@ function validateAttemptOptions({
   };
 }
 
-async function emitEvent(onEvent, event) {
-  if (!onEvent) return;
-  try {
-    await onEvent(Object.freeze({ schema: AUTH_EVENT_SCHEMA, ...event }));
-  } catch (cause) {
-    if (cause instanceof AuthError) throw cause;
-    throw new AuthError('OUTPUT_FAILED', 'Authentication event delivery failed.', { cause });
-  }
+function createEventDispatcher(onEvent) {
+  let tail = Promise.resolve();
+  return (event) => {
+    if (!onEvent) return Promise.resolve();
+    const record = Object.freeze({ schema: AUTH_EVENT_SCHEMA, ...event });
+    const delivery = tail.then(async () => {
+      try {
+        await onEvent(record);
+      } catch (cause) {
+        if (cause instanceof AuthError) throw cause;
+        throw new AuthError('OUTPUT_FAILED', 'Authentication event delivery failed.', { cause });
+      }
+    });
+    tail = delivery;
+    return delivery;
+  };
 }
 
 function logMessage(log, message) {
@@ -159,34 +166,16 @@ function jwtExpiry(token, now) {
   }
 }
 
-function expiryMetadata(token, expiresIn) {
+function expiryMetadata(token) {
   const now = Date.now();
   const jwtExpiresAt = jwtExpiry(token, now);
   if (jwtExpiresAt !== null) {
     return { expiresAt: jwtExpiresAt, expirySource: 'jwt-exp' };
   }
-
-  if (expiresIn === null || expiresIn === undefined || expiresIn === '') {
-    return { expiresAt: null, expirySource: null };
-  }
-
-  const raw = Number(expiresIn);
-  if (!Number.isSafeInteger(raw) || raw <= 0) {
-    return { expiresAt: null, expirySource: null };
-  }
-
-  // OAuth normally defines expires_in in seconds. IMS has also emitted a
-  // millisecond value (for example 86400000). Values larger than the maximum
-  // supported seconds window are therefore interpreted as milliseconds.
-  const durationMs = raw <= MAX_EXPIRY_SECONDS ? raw * 1000 : raw;
-  if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > MAX_EXPIRY_MS) {
-    return { expiresAt: null, expirySource: null };
-  }
-
-  return {
-    expiresAt: now + durationMs,
-    expirySource: 'ims-expires-in',
-  };
+  // IMS deployments have emitted `expires_in` in both seconds and
+  // milliseconds. Never infer a unit from magnitude: an opaque token gets an
+  // unknown expiry and therefore cannot be over-trusted by the cache.
+  return { expiresAt: null, expirySource: null };
 }
 
 // ─── OAuth callback server ───────────────────────────────────────────────────
@@ -291,13 +280,15 @@ function callbackError(code, message, retryable = false) {
   return new AuthError(code, message, { retryable });
 }
 
-function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
-  let server;
+function createCallbackAttempt({ expectedState, timeoutMs, signal, emit }) {
+  const loopbackHosts = ['::1', '127.0.0.1'];
+  const servers = [];
   let timeout;
-  let bound = false;
   let settled = false;
+  let bindingFinished = false;
+  let finalizing = false;
+  let terminal;
   let readySettled = false;
-  const sockets = new Set();
   let resolveReady;
   let rejectReady;
   let resolveResult;
@@ -315,13 +306,13 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
   // an early bind/abort failure cannot become an unhandled rejection.
   void result.catch(() => {});
 
-  const closeServer = (force) => new Promise((resolve) => {
-    if (!server || !bound) {
+  const closeEntry = (entry, force) => new Promise((resolve) => {
+    if (!entry.bound) {
       resolve();
       return;
     }
 
-    bound = false;
+    entry.bound = false;
     let closed = false;
     const done = () => {
       if (closed) return;
@@ -330,18 +321,18 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
     };
 
     try {
-      server.close(done);
+      entry.server.close(done);
     } catch {
       done();
     }
 
     if (force) {
       try {
-        server.closeAllConnections?.();
+        entry.server.closeAllConnections?.();
       } catch {
         // Best-effort cleanup for Node versions that expose this method.
       }
-      for (const socket of sockets) {
+      for (const socket of entry.sockets) {
         try {
           socket.destroy();
         } catch {
@@ -352,32 +343,54 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
     }
   });
 
-  const onAbort = () => settle(abortError(), undefined, true);
+  const finalize = () => {
+    if (finalizing || !bindingFinished || !terminal) return;
+    finalizing = true;
+
+    if (!readySettled && terminal.error) {
+      readySettled = true;
+      rejectReady(terminal.error);
+    }
+
+    void Promise.all(servers.map((entry) => closeEntry(entry, terminal.force))).then(() => {
+      if (terminal.error) rejectResult(terminal.error);
+      else resolveResult(terminal.value);
+    });
+  };
 
   const settle = (error, value, force = false) => {
     if (settled) return;
     settled = true;
+    terminal = { error, value, force };
     clearTimeout(timeout);
     signal?.removeEventListener('abort', onAbort);
-
-    if (!readySettled && error) {
-      readySettled = true;
-      rejectReady(error);
-    }
-
-    void closeServer(force).then(() => {
-      if (error) rejectResult(error);
-      else resolveResult(value);
-    });
+    finalize();
   };
+
+  const onAbort = () => settle(abortError(), undefined, true);
 
   const rejectCallback = async (res, code, statusCode = 400) => {
     sendResponse(res, statusCode, 'Authorization callback rejected.');
     try {
-      await emitEvent(onEvent, { event: 'callback_rejected', code });
+      await emit({ event: 'callback_rejected', code });
     } catch (error) {
       settle(error, undefined, true);
     }
+  };
+
+  const settleAfterResponse = (res, statusCode, body, error, value) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      settle(error, value, true);
+    };
+    if (typeof res.once === 'function') {
+      res.once('finish', finish);
+      res.once('close', finish);
+    }
+    sendResponse(res, statusCode, body);
+    if (typeof res.once !== 'function') finish();
   };
 
   const handleRequest = async (req, res) => {
@@ -421,16 +434,15 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
       }
 
       const token = params.get('access_token');
-      const expiresIn = params.get('expires_in');
       const oauthFailure = params.has('error');
 
       if (oauthFailure) {
-        sendResponse(res, 400, 'Authorization was denied.');
-        settle(callbackError(
-          'OAUTH_ACCESS_DENIED',
-          'Adobe IMS authorization was denied.',
-          true,
-        ));
+        settleAfterResponse(
+          res,
+          400,
+          'Authorization was denied.',
+          callbackError('OAUTH_ACCESS_DENIED', 'Adobe IMS authorization was denied.', true),
+        );
         return;
       }
 
@@ -439,8 +451,7 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
         return;
       }
 
-      sendResponse(res, 204);
-      settle(null, { token, expiresIn });
+      settleAfterResponse(res, 204, '', null, { token });
       return;
     }
 
@@ -452,31 +463,84 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
     sendResponse(res, 404, 'Not found.');
   };
 
-  server = http.createServer((req, res) => {
-    void handleRequest(req, res).catch(() => {
-      sendResponse(res, 500, 'Authorization callback failed.');
+  const bindHost = (host) => new Promise((resolve) => {
+    const entry = {
+      host,
+      server: http.createServer((req, res) => {
+        void handleRequest(req, res).catch(() => {
+          settleAfterResponse(
+            res,
+            500,
+            'Authorization callback failed.',
+            callbackError(
+              'CALLBACK_INVALID',
+              'The authorization callback could not be processed.',
+              true,
+            ),
+          );
+        });
+      }),
+      sockets: new Set(),
+      bound: false,
+      bindFinished: false,
+    };
+    servers.push(entry);
+
+    entry.server.requestTimeout = timeoutMs;
+    entry.server.headersTimeout = timeoutMs;
+    entry.server.on('connection', (socket) => {
+      entry.sockets.add(socket);
+      socket.setTimeout?.(timeoutMs, () => socket.destroy());
+      socket.once?.('close', () => entry.sockets.delete(socket));
+    });
+
+    const finishBind = (outcome) => {
+      if (entry.bindFinished) return;
+      entry.bindFinished = true;
+      resolve(outcome);
+    };
+
+    entry.server.on('error', (cause) => {
+      if (!entry.bindFinished) {
+        if (['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(cause?.code)) {
+          finishBind({ supported: false, entry });
+          return;
+        }
+        const portInUse = cause?.code === 'EADDRINUSE';
+        finishBind({
+          error: callbackError(
+            portInUse ? 'CALLBACK_PORT_IN_USE' : 'CALLBACK_SERVER_FAILED',
+            portInUse
+              ? `Another authentication attempt is already using callback port ${CALLBACK_PORT}.`
+              : `The authentication callback server could not bind to port ${CALLBACK_PORT}.`,
+            true,
+          ),
+          entry,
+        });
+        return;
+      }
       settle(callbackError(
-        'CALLBACK_INVALID',
-        'The authorization callback could not be processed.',
+        'CALLBACK_SERVER_FAILED',
+        `The authentication callback server failed on port ${CALLBACK_PORT}.`,
         true,
       ), undefined, true);
     });
-  });
 
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once?.('close', () => sockets.delete(socket));
-  });
-
-  server.once('error', (cause) => {
-    const portInUse = cause?.code === 'EADDRINUSE';
-    settle(callbackError(
-      portInUse ? 'CALLBACK_PORT_IN_USE' : 'CALLBACK_SERVER_FAILED',
-      portInUse
-        ? `Another authentication attempt is already using callback port ${CALLBACK_PORT}.`
-        : `The authentication callback server could not bind to port ${CALLBACK_PORT}.`,
-      true,
-    ), undefined, true);
+    try {
+      entry.server.listen(CALLBACK_PORT, host, () => {
+        entry.bound = true;
+        finishBind({ supported: true, entry });
+      });
+    } catch {
+      finishBind({
+        error: callbackError(
+          'CALLBACK_SERVER_FAILED',
+          `The authentication callback server could not bind to port ${CALLBACK_PORT}.`,
+          true,
+        ),
+        entry,
+      });
+    }
   });
 
   timeout = setTimeout(() => {
@@ -486,25 +550,27 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, onEvent }) {
       true,
     ), undefined, true);
   }, timeoutMs);
-
   signal?.addEventListener('abort', onAbort, { once: true });
 
-  try {
-    server.listen(CALLBACK_PORT, 'localhost', () => {
-      if (settled) return;
-      bound = true;
-      if (!readySettled) {
+  void Promise.all(loopbackHosts.map(bindHost)).then((outcomes) => {
+    bindingFinished = true;
+    if (!settled) {
+      const failure = outcomes.find(({ error }) => error)?.error;
+      const supported = outcomes.some(({ supported }) => supported);
+      if (failure) settle(failure, undefined, true);
+      else if (!supported) {
+        settle(callbackError(
+          'CALLBACK_SERVER_FAILED',
+          'No supported localhost address was available for authentication.',
+          true,
+        ), undefined, true);
+      } else if (!readySettled) {
         readySettled = true;
         resolveReady();
       }
-    });
-  } catch (cause) {
-    settle(callbackError(
-      'CALLBACK_SERVER_FAILED',
-      `The authentication callback server could not bind to port ${CALLBACK_PORT}.`,
-      true,
-    ), undefined, true);
-  }
+    }
+    finalize();
+  });
 
   return {
     ready,
@@ -532,36 +598,85 @@ function authorizationUrl({ state, reauthenticate }) {
   return `${IMS_ORIGIN}/ims/authorize/v2?${params}`;
 }
 
+function createLifecycleGuard({ timeoutMs, signal }) {
+  let rejectGuard;
+  let disposed = false;
+  const deadlineAt = Date.now() + timeoutMs;
+  const promise = new Promise((resolve, reject) => {
+    rejectGuard = reject;
+  });
+  void promise.catch(() => {});
+
+  const onAbort = () => rejectGuard(abortError());
+  const timeout = setTimeout(() => rejectGuard(callbackError(
+    'AUTH_TIMEOUT',
+    'Authentication timed out before the operation completed.',
+    true,
+  )), timeoutMs);
+  signal?.addEventListener('abort', onAbort, { once: true });
+
+  return {
+    deadlineAt,
+    promise,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
+async function whileAttemptActive(operation, attempt, guard) {
+  // URL delivery and browser launch are caller/platform operations. An abort,
+  // bind failure, or timeout must still be able to end the attempt while one
+  // of those operations is pending.
+  const failure = attempt.result.then(
+    () => new Promise(() => {}),
+    (error) => Promise.reject(error),
+  );
+  return Promise.race([operation, failure, guard.promise]);
+}
+
+async function openWhileAttemptActive(operation, attempt, guard) {
+  return Promise.race([
+    operation.then(() => ({ source: 'browser' })),
+    attempt.result.then((value) => ({ source: 'callback', value })),
+    guard.promise,
+  ]);
+}
+
 async function browserAttempt({
   reauthenticate,
   openBrowser,
   timeoutMs,
   signal,
-  onEvent,
+  emit,
   log,
+  guard,
 }) {
   const state = crypto.randomBytes(16).toString('hex');
   const authUrl = authorizationUrl({ state, reauthenticate });
-  const deadlineAt = Date.now() + timeoutMs;
+  const { deadlineAt } = guard;
   const attempt = createCallbackAttempt({
     expectedState: state,
     timeoutMs,
     signal,
-    onEvent,
+    emit,
   });
   let heartbeat;
   let heartbeatBusy = false;
 
   try {
     await attempt.ready;
-    await emitEvent(onEvent, {
+    await whileAttemptActive(emit({
       event: 'authorization_url',
       url: authUrl,
       redirectUri: REDIRECT_URI,
       callbackPort: CALLBACK_PORT,
       deadlineAt,
       reauthenticationRequested: reauthenticate,
-    });
+    }), attempt, guard);
 
     logMessage(log, openBrowser
       ? 'Opening browser for da.live login…'
@@ -569,10 +684,15 @@ async function browserAttempt({
     logMessage(log, `If the browser does not open automatically, visit:\n  ${authUrl}\n`);
     logMessage(log, 'Waiting for login to complete…');
 
-    if (openBrowser) {
+    let callback;
+    if (attempt.isSettled()) {
+      callback = await Promise.race([attempt.result, guard.promise]);
+    } else if (openBrowser) {
       try {
-        await open(authUrl);
+        const outcome = await openWhileAttemptActive(open(authUrl), attempt, guard);
+        if (outcome.source === 'callback') callback = outcome.value;
       } catch (cause) {
+        if (cause instanceof AuthError) throw cause;
         throw new AuthError(
           'BROWSER_OPEN_FAILED',
           'The system browser could not be opened.',
@@ -581,11 +701,11 @@ async function browserAttempt({
       }
     }
 
-    if (onEvent && timeoutMs > HEARTBEAT_MS) {
+    if (timeoutMs > HEARTBEAT_MS) {
       heartbeat = setInterval(() => {
         if (heartbeatBusy || attempt.isSettled()) return;
         heartbeatBusy = true;
-        void emitEvent(onEvent, {
+        void emit({
           event: 'waiting',
           remainingMs: Math.max(0, deadlineAt - Date.now()),
         }).catch((error) => attempt.cancel(error)).finally(() => {
@@ -595,8 +715,9 @@ async function browserAttempt({
       heartbeat.unref?.();
     }
 
-    const { token, expiresIn } = await attempt.result;
-    const { expiresAt, expirySource } = expiryMetadata(token, expiresIn);
+    if (!callback) callback = await Promise.race([attempt.result, guard.promise]);
+    const { token } = callback;
+    const { expiresAt, expirySource } = expiryMetadata(token);
     return {
       token,
       expiresAt,
@@ -619,15 +740,15 @@ async function browserAttempt({
   }
 }
 
-async function emitCompleted(onEvent, result) {
-  await emitEvent(onEvent, {
+async function emitCompleted(emit, result, guard) {
+  await Promise.race([emit({
     event: 'completed',
     tokenAcquired: result.tokenAcquired,
     persisted: result.persisted,
     expiresAt: result.expiresAt,
     expirySource: result.expirySource,
     reauthenticationRequested: result.reauthenticationRequested,
-  });
+  }), guard.promise]);
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -646,9 +767,15 @@ async function emitCompleted(onEvent, result) {
  */
 export async function acquireToken(opts = {}) {
   const options = validateAttemptOptions(opts);
-  const result = await browserAttempt({ ...options, log: undefined });
-  await emitCompleted(options.onEvent, result);
-  return result;
+  const emit = createEventDispatcher(options.onEvent);
+  const guard = createLifecycleGuard(options);
+  try {
+    const result = await browserAttempt({ ...options, emit, guard, log: undefined });
+    await emitCompleted(emit, result, guard);
+    return result;
+  } finally {
+    guard.dispose();
+  }
 }
 
 /**
@@ -683,6 +810,7 @@ export async function getValidToken({
     signal,
     onEvent,
   });
+  const emit = createEventDispatcher(onEvent);
 
   if (!reauthenticate) {
     let stored;
@@ -701,20 +829,25 @@ export async function getValidToken({
     }
   }
 
-  const candidate = await browserAttempt({ ...options, log });
+  const guard = createLifecycleGuard(options);
   try {
-    await storeToken({
-      access_token: candidate.token,
-      expires_at: candidate.expiresAt,
-    });
-  } catch (cause) {
-    throw new AuthError('STORE_FAILED', 'The acquired token could not be stored.', { cause });
-  }
+    const candidate = await browserAttempt({ ...options, emit, guard, log });
+    try {
+      await storeToken({
+        access_token: candidate.token,
+        expires_at: candidate.expiresAt,
+      });
+    } catch (cause) {
+      throw new AuthError('STORE_FAILED', 'The acquired token could not be stored.', { cause });
+    }
 
-  const result = { ...candidate, persisted: true };
-  logMessage(log, `Login successful. Token saved to ${TOKEN_FILE}`);
-  await emitCompleted(onEvent, result);
-  return result.token;
+    const result = { ...candidate, persisted: true };
+    logMessage(log, `Login successful. Token saved to ${TOKEN_FILE}`);
+    await emitCompleted(emit, result, guard);
+    return result.token;
+  } finally {
+    guard.dispose();
+  }
 }
 
 /**

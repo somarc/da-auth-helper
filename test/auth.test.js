@@ -22,7 +22,7 @@ jest.unstable_mockModule('open', () => ({ default: mockOpen }));
 // ─── Mock http ────────────────────────────────────────────────────────────────
 
 let capturedRequestHandler;
-let currentServer;
+let currentServers;
 let listenError;
 
 function makeServer() {
@@ -30,9 +30,10 @@ function makeServer() {
   const server = {
     listening: false,
     listen: jest.fn((port, host, callback) => {
-      queueMicrotask(() => {
-        if (listenError) {
-          emitter.emit('error', listenError);
+      Promise.resolve().then(() => {
+        const error = typeof listenError === 'function' ? listenError(host) : listenError;
+        if (error) {
+          emitter.emit('error', error);
           return;
         }
         server.listening = true;
@@ -65,8 +66,9 @@ function makeServer() {
 
 const mockHttpCreate = jest.fn((handler) => {
   capturedRequestHandler = handler;
-  currentServer = makeServer();
-  return currentServer;
+  const server = makeServer();
+  currentServers.push(server);
+  return server;
 });
 jest.unstable_mockModule('http', () => ({ default: { createServer: mockHttpCreate } }));
 
@@ -91,7 +93,7 @@ function makeReq(pathname, {
   req.url = pathname;
   req.method = method;
   req.headers = headers;
-  queueMicrotask(() => {
+  Promise.resolve().then(() => {
     if (body) req.emit('data', Buffer.from(body));
     req.emit('end');
   });
@@ -171,7 +173,7 @@ function eventCollector({ completeWith, expiresIn = '3600', controller, callback
 beforeEach(() => {
   jest.clearAllMocks();
   capturedRequestHandler = undefined;
-  currentServer = undefined;
+  currentServers = [];
   listenError = undefined;
   mockLoadStoredToken.mockResolvedValue(null);
   mockStoreToken.mockResolvedValue(undefined);
@@ -233,7 +235,9 @@ describe('caller-owned acquireToken contract', () => {
 
     const result = await acquireToken({ openBrowser: false, onEvent });
 
-    expect(currentServer.listen).toHaveBeenCalledWith(9898, 'localhost', expect.any(Function));
+    expect(currentServers).toHaveLength(2);
+    expect(currentServers.map((server) => server.listen.mock.calls[0][1]).sort())
+      .toEqual(['127.0.0.1', '::1']);
     expect(mockOpen).not.toHaveBeenCalled();
     expect(mockLoadStoredToken).not.toHaveBeenCalled();
     expect(mockStoreToken).not.toHaveBeenCalled();
@@ -304,22 +308,15 @@ describe('caller-owned acquireToken contract', () => {
     expect(new URL(mockOpen.mock.calls[0][0]).searchParams.has('prompt')).toBe(false);
   });
 
-  test('interprets ordinary expires_in as seconds', async () => {
-    const before = Date.now();
-    const { events, onEvent } = eventCollector({ completeWith: 'TOKEN', expiresIn: '3600' });
-    const result = await acquireToken({ openBrowser: false, onEvent });
-    expect(result.expirySource).toBe('ims-expires-in');
-    expect(result.expiresAt).toBeGreaterThanOrEqual(before + 3_600_000);
-    expect(events.at(-1).expiresAt).toBe(result.expiresAt);
-  });
-
-  test('interprets the observed IMS 86400000 expires_in value as milliseconds', async () => {
-    const before = Date.now();
-    const { onEvent } = eventCollector({ completeWith: 'TOKEN', expiresIn: '86400000' });
-    const result = await acquireToken({ openBrowser: false, onEvent });
-    expect(result.expiresAt).toBeGreaterThanOrEqual(before + 86_400_000);
-    expect(result.expiresAt).toBeLessThan(before + 86_400_000 + 1000);
-  });
+  test.each(['3600', '300000', '1800000', '86400000'])(
+    'does not infer a unit for opaque-token expires_in=%s',
+    async (expiresIn) => {
+      const { events, onEvent } = eventCollector({ completeWith: 'TOKEN', expiresIn });
+      const result = await acquireToken({ openBrowser: false, onEvent });
+      expect(result).toMatchObject({ expiresAt: null, expirySource: null });
+      expect(events.at(-1)).toMatchObject({ expiresAt: null, expirySource: null });
+    },
+  );
 
   test('prefers a bounded JWT exp claim over expires_in', async () => {
     const expiresAt = Date.now() + 10 * 60 * 1000;
@@ -338,6 +335,69 @@ describe('caller-owned acquireToken contract', () => {
       expiresAt: null,
       expirySource: null,
     });
+  });
+
+  test('retains compatibility with an existing one-hour timeout', async () => {
+    const { onEvent } = eventCollector({ completeWith: 'TOKEN' });
+    await expect(acquireToken({
+      openBrowser: false,
+      timeoutMs: 3_600_000,
+      onEvent,
+    })).resolves.toMatchObject({ token: 'TOKEN' });
+  });
+
+  test('serializes a slow waiting event before the terminal completed event', async () => {
+    jest.useFakeTimers();
+    let authorization;
+    let authorizationStarted;
+    const authorized = new Promise((resolve) => { authorizationStarted = resolve; });
+    let releaseWaiting;
+    let waitingStarted;
+    const waiting = new Promise((resolve) => { waitingStarted = resolve; });
+    const release = new Promise((resolve) => { releaseWaiting = resolve; });
+    const seen = [];
+
+    try {
+      const pending = acquireToken({
+        openBrowser: false,
+        timeoutMs: 30_000,
+        async onEvent(event) {
+          seen.push(`start:${event.event}`);
+          if (event.event === 'authorization_url') {
+            authorization = event;
+            authorizationStarted();
+          }
+          if (event.event === 'waiting') {
+            waitingStarted();
+            await release;
+          }
+          seen.push(`end:${event.event}`);
+        },
+      });
+
+      await authorized;
+      await jest.advanceTimersByTimeAsync(15_000);
+      await waiting;
+      await postCallback({
+        access_token: 'TOKEN',
+        state: stateFromUrl(authorization.url),
+      });
+      await Promise.resolve();
+      expect(seen).not.toContain('start:completed');
+
+      releaseWaiting();
+      await expect(pending).resolves.toMatchObject({ token: 'TOKEN' });
+      expect(seen).toEqual([
+        'start:authorization_url',
+        'end:authorization_url',
+        'start:waiting',
+        'end:waiting',
+        'start:completed',
+        'end:completed',
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -469,9 +529,89 @@ describe('attempt lifecycle and typed failures', () => {
       signal: controller.signal,
       onEvent,
     })).rejects.toMatchObject({ code: 'AUTH_CANCELLED', name: 'AbortError' });
-    expect(currentServer.close).toHaveBeenCalledTimes(1);
-    expect(currentServer.closeAllConnections).toHaveBeenCalledTimes(1);
+    expect(currentServers.every((server) => server.close.mock.calls.length === 1)).toBe(true);
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
     expect(mockStoreToken).not.toHaveBeenCalled();
+  });
+
+  test('cancellation interrupts a pending authorization event sink', async () => {
+    const controller = new AbortController();
+    let eventStarted;
+    const started = new Promise((resolve) => { eventStarted = resolve; });
+    const pending = acquireToken({
+      openBrowser: false,
+      signal: controller.signal,
+      onEvent: async () => {
+        eventStarted();
+        await new Promise(() => {});
+      },
+    });
+
+    await started;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({
+      code: 'AUTH_CANCELLED',
+      name: 'AbortError',
+    });
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
+  });
+
+  test('the deadline interrupts a pending authorization event sink', async () => {
+    let eventStarted;
+    const started = new Promise((resolve) => { eventStarted = resolve; });
+    const pending = acquireToken({
+      openBrowser: false,
+      timeoutMs: 20,
+      onEvent: async () => {
+        eventStarted();
+        await new Promise(() => {});
+      },
+    });
+
+    await started;
+    await expect(pending).rejects.toMatchObject({ code: 'AUTH_TIMEOUT' });
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
+  });
+
+  test('an immediate abort waits for late bind callbacks and releases both listeners', async () => {
+    const controller = new AbortController();
+    const pending = acquireToken({
+      openBrowser: false,
+      signal: controller.signal,
+      onEvent: jest.fn(),
+    });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ code: 'AUTH_CANCELLED' });
+    expect(currentServers).toHaveLength(2);
+    expect(currentServers.every((server) => server.close.mock.calls.length === 1)).toBe(true);
+
+    const next = eventCollector({ completeWith: 'NEXT' });
+    await expect(acquireToken({ openBrowser: false, onEvent: next.onEvent }))
+      .resolves.toMatchObject({ token: 'NEXT' });
+  });
+
+  test('cancellation interrupts a pending browser-launch operation', async () => {
+    const controller = new AbortController();
+    let openStarted;
+    const started = new Promise((resolve) => { openStarted = resolve; });
+    mockOpen.mockImplementationOnce(async () => {
+      openStarted();
+      await new Promise(() => {});
+    });
+    const pending = acquireToken({ signal: controller.signal });
+
+    await started;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({
+      code: 'AUTH_CANCELLED',
+      name: 'AbortError',
+    });
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
   });
 
   test('times out deterministically and closes the listener', async () => {
@@ -481,8 +621,9 @@ describe('attempt lifecycle and typed failures', () => {
       timeoutMs: 20,
       onEvent,
     })).rejects.toMatchObject({ code: 'AUTH_TIMEOUT', retryable: true });
-    expect(currentServer.close).toHaveBeenCalledTimes(1);
-    expect(currentServer.closeAllConnections).toHaveBeenCalledTimes(1);
+    expect(currentServers.every((server) => server.close.mock.calls.length === 1)).toBe(true);
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
   });
 
   test('classifies a fixed-port collision before emitting a URL or opening a browser', async () => {
@@ -499,6 +640,46 @@ describe('attempt lifecycle and typed failures', () => {
     expect(mockOpen).not.toHaveBeenCalled();
   });
 
+  test('fails closed when only one loopback address family is already occupied', async () => {
+    listenError = (host) => (host === '127.0.0.1'
+      ? Object.assign(new Error('private operating system detail'), { code: 'EADDRINUSE' })
+      : undefined);
+    const onEvent = jest.fn();
+
+    await expect(acquireToken({ openBrowser: false, onEvent })).rejects.toMatchObject({
+      code: 'CALLBACK_PORT_IN_USE',
+    });
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(currentServers[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  test('continues when an unavailable address family is not supported by the host', async () => {
+    listenError = (host) => (host === '::1'
+      ? Object.assign(new Error('IPv6 unavailable'), { code: 'EAFNOSUPPORT' })
+      : undefined);
+    const { onEvent } = eventCollector({ completeWith: 'IPV4_ONLY' });
+    await expect(acquireToken({ openBrowser: false, onEvent }))
+      .resolves.toMatchObject({ token: 'IPV4_ONLY' });
+  });
+
+  test('force-closes unrelated sockets after accepting the genuine callback', async () => {
+    const unrelatedSocket = {
+      destroy: jest.fn(),
+      setTimeout: jest.fn(),
+      once: jest.fn(),
+    };
+    const { onEvent } = eventCollector({
+      callback: async (event) => {
+        currentServers[0].emit('connection', unrelatedSocket);
+        await postCallback({ access_token: 'TOKEN', state: stateFromUrl(event.url) });
+      },
+    });
+
+    await expect(acquireToken({ openBrowser: false, onEvent }))
+      .resolves.toMatchObject({ token: 'TOKEN' });
+    expect(unrelatedSocket.destroy).toHaveBeenCalledTimes(1);
+  });
+
   test('cleans up when browser launch fails without exposing the nested error', async () => {
     mockOpen.mockRejectedValueOnce(new Error('secret nested platform detail'));
     const { events, onEvent } = eventCollector();
@@ -507,7 +688,8 @@ describe('attempt lifecycle and typed failures', () => {
       message: 'The system browser could not be opened.',
     });
     expect(JSON.stringify(events)).not.toContain('secret nested platform detail');
-    expect(currentServer.closeAllConnections).toHaveBeenCalledTimes(1);
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
   });
 
   test('cleans up when the URL event consumer fails', async () => {
@@ -516,14 +698,15 @@ describe('attempt lifecycle and typed failures', () => {
       code: 'OUTPUT_FAILED',
       message: 'Authentication event delivery failed.',
     });
-    expect(currentServer.closeAllConnections).toHaveBeenCalledTimes(1);
+    expect(currentServers.every((server) => server.closeAllConnections.mock.calls.length === 1))
+      .toBe(true);
     expect(mockOpen).not.toHaveBeenCalled();
   });
 
   test.each([
     ['zero timeout', { timeoutMs: 0 }],
     ['negative timeout', { timeoutMs: -1 }],
-    ['oversized timeout', { timeoutMs: 30 * 60 * 1000 + 1 }],
+    ['oversized timeout', { timeoutMs: 2_147_483_648 }],
     ['invalid callback', { onEvent: 'not-a-function' }],
     ['invalid browser flag', { openBrowser: 'no' }],
     ['invalid reauthentication flag', { reauthenticate: 'yes' }],
@@ -536,21 +719,24 @@ describe('attempt lifecycle and typed failures', () => {
 describe('legacy persistence and logout', () => {
   test('persists the acquired token and emits only token-free completion metadata', async () => {
     const events = [];
-    completeFromOpen('SAVED_TOKEN', '3600');
+    const expiresAt = Math.floor((Date.now() + 3_600_000) / 1000) * 1000;
+    const payload = Buffer.from(JSON.stringify({ exp: expiresAt / 1000 })).toString('base64url');
+    const savedToken = `header.${payload}.signature`;
+    completeFromOpen(savedToken, '3600');
     const token = await getValidToken({
       log: () => {},
       onEvent: async (event) => { events.push(event); },
     });
 
-    expect(token).toBe('SAVED_TOKEN');
+    expect(token).toBe(savedToken);
     expect(mockStoreToken).toHaveBeenCalledWith(
       expect.objectContaining({
-        access_token: 'SAVED_TOKEN',
-        expires_at: expect.any(Number),
+        access_token: savedToken,
+        expires_at: expiresAt,
       }),
     );
     expect(events.at(-1)).toMatchObject({ event: 'completed', persisted: true });
-    expect(JSON.stringify(events)).not.toContain('SAVED_TOKEN');
+    expect(JSON.stringify(events)).not.toContain(savedToken);
   });
 
   test('maps storage failure without leaking nested filesystem details', async () => {

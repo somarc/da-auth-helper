@@ -86,7 +86,7 @@ Result shape:
 {
   token,                       // secret string
   expiresAt,                   // Unix epoch milliseconds or null
-  expirySource,                // "jwt-exp", "ims-expires-in", or null
+  expirySource,                // "jwt-exp" or null
   tokenAcquired: true,
   persisted: false,
   reauthenticationRequested,  // boolean
@@ -101,7 +101,7 @@ Result shape:
 | `log` | `(message: string) => void` | `console.info` | `getValidToken()` human-readable status sink. It never receives the token. |
 | `reauthenticate` | `boolean` | `false` | Bypass the helper cache where applicable and add IMS `prompt=login`. |
 | `openBrowser` | `boolean` | `true` | Launch the operating-system browser. Set false for caller-owned browser handoff. |
-| `timeoutMs` | `number` | `300000` | Positive integer attempt deadline, up to 30 minutes. |
+| `timeoutMs` | `number` | `300000` | Positive integer attempt deadline accepted by the Node.js timer API. |
 | `signal` | `AbortSignal` | — | Cancels the callback listener and active attempt. |
 | `onEvent` | `(event) => void \| Promise<void>` | — | Receives versioned, token-free lifecycle events. |
 
@@ -200,7 +200,7 @@ The fixed callback port is the global attempt mutex. A concurrent attempt fails 
 
 Default cached credentials are stored at `~/.aem/da-token.json`. The helper validates that the directory and file are current-user-owned real filesystem objects, repairs their modes to `0700` and `0600`, rejects symlinks and multiply linked files, and replaces credentials through an exclusive same-directory temporary file plus atomic rename. The prior credential remains intact until replacement succeeds.
 
-IMS commonly issues 24-hour tokens. Expiry is normalized to Unix epoch milliseconds from a bounded JWT `exp` claim when available, otherwise from a bounded IMS `expires_in` value. Callers that request reauthentication should still verify persisted status and expiry advancement after their own final write; helper exit alone is not authorization proof.
+IMS commonly issues 24-hour tokens. Expiry is normalized to Unix epoch milliseconds only from a bounded JWT `exp` claim. IMS deployments have emitted ambiguous `expires_in` units, so an opaque token reports unknown expiry rather than risking an overlong cache lifetime. Callers that request reauthentication should still verify persisted status and expiry advancement after their own final write; helper exit alone is not authorization proof.
 
 ## License
 

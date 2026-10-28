@@ -75,6 +75,37 @@ describe('secure token storage', () => {
     expect(await fs.readdir(path.dirname(tokenFile))).toEqual(['da-token.json']);
   });
 
+  test('does not report rollback after rename has committed the new credential', async () => {
+    await storeToken({ access_token: 'OLD', expires_at: 123456789 }, tokenFile);
+    let renamed = false;
+    const fsImpl = {
+      ...fs,
+      async rename(from, to) {
+        await fs.rename(from, to);
+        renamed = true;
+      },
+      async open(target, ...args) {
+        const handle = await fs.open(target, ...args);
+        if (renamed && target === path.dirname(tokenFile)) {
+          return {
+            async sync() {
+              throw Object.assign(new Error('simulated directory fsync failure'), { code: 'EIO' });
+            },
+            close: () => handle.close(),
+          };
+        }
+        return handle;
+      },
+    };
+
+    await expect(storeToken(
+      { access_token: 'NEW', expires_at: 223456789 },
+      tokenFile,
+      { fsImpl },
+    )).resolves.toBeUndefined();
+    await expect(loadStoredToken(tokenFile)).resolves.toMatchObject({ access_token: 'NEW' });
+  });
+
   test('rejects a symlink credential rather than following it', async () => {
     const outside = path.join(temporaryHome, 'outside.json');
     await fs.mkdir(path.dirname(tokenFile), { recursive: true, mode: 0o700 });

@@ -72,30 +72,33 @@ async function secureDirectory(directory, fsImpl) {
   }
   assertSecureDirectory(stats);
 
-  if ((stats.mode & 0o777) !== 0o700) {
-    await fsImpl.chmod(directory, 0o700);
-    stats = await fsImpl.lstat(directory);
-    assertSecureDirectory(stats);
-    if ((stats.mode & 0o777) !== 0o700) {
-      throw storeError('The credential directory permissions could not be secured.');
+  let flags = noFollowFlags(FS_CONSTANTS.O_RDONLY);
+  if (FS_CONSTANTS.O_DIRECTORY !== undefined) flags |= FS_CONSTANTS.O_DIRECTORY;
+  const handle = await fsImpl.open(directory, flags);
+  try {
+    let opened = await handle.stat();
+    assertSecureDirectory(opened);
+    if (opened.dev !== stats.dev || opened.ino !== stats.ino) {
+      throw storeError('The credential directory changed while it was being opened.');
     }
+    if ((opened.mode & 0o777) !== 0o700) {
+      await handle.chmod(0o700);
+      opened = await handle.stat();
+      assertSecureDirectory(opened);
+      if ((opened.mode & 0o777) !== 0o700) {
+        throw storeError('The credential directory permissions could not be secured.');
+      }
+    }
+    return opened;
+  } finally {
+    await handle.close();
   }
-  return stats;
 }
 
-async function inspectExistingToken(tokenFile, fsImpl, { repairMode }) {
-  let stats = await lstatIfPresent(tokenFile, fsImpl);
+async function inspectExistingToken(tokenFile, fsImpl) {
+  const stats = await lstatIfPresent(tokenFile, fsImpl);
   if (!stats) return null;
   assertSecureFile(stats);
-
-  if ((stats.mode & 0o777) !== 0o600 && repairMode) {
-    await fsImpl.chmod(tokenFile, 0o600);
-    stats = await fsImpl.lstat(tokenFile);
-    assertSecureFile(stats);
-  }
-  if ((stats.mode & 0o777) !== 0o600) {
-    throw storeError('The credential file permissions are not private.');
-  }
   return stats;
 }
 
@@ -106,10 +109,18 @@ function noFollowFlags(base) {
 async function openVerifiedToken(tokenFile, expected, fsImpl) {
   const handle = await fsImpl.open(tokenFile, noFollowFlags(FS_CONSTANTS.O_RDONLY));
   try {
-    const opened = await handle.stat();
+    let opened = await handle.stat();
     assertSecureFile(opened);
     if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
       throw storeError('The credential file changed while it was being opened.');
+    }
+    if ((opened.mode & 0o777) !== 0o600) {
+      await handle.chmod(0o600);
+      opened = await handle.stat();
+      assertSecureFile(opened);
+      if ((opened.mode & 0o777) !== 0o600) {
+        throw storeError('The credential file permissions could not be secured.');
+      }
     }
     if (opened.size > MAX_TOKEN_FILE_BYTES) {
       throw storeError('The credential file is unexpectedly large.');
@@ -159,7 +170,7 @@ export async function loadStoredToken(tokenFile = TOKEN_FILE, { fsImpl = fs } = 
     const stats = await lstatIfPresent(tokenFile, fsImpl);
     if (!stats) return null;
     await secureDirectory(path.dirname(tokenFile), fsImpl);
-    const secured = await inspectExistingToken(tokenFile, fsImpl, { repairMode: true });
+    const secured = await inspectExistingToken(tokenFile, fsImpl);
     const contents = await openVerifiedToken(tokenFile, secured, fsImpl);
     try {
       return JSON.parse(contents);
@@ -189,7 +200,8 @@ export async function storeToken(tokenData, tokenFile = TOKEN_FILE, {
 
   try {
     await secureDirectory(directory, fsImpl);
-    await inspectExistingToken(tokenFile, fsImpl, { repairMode: true });
+    const existing = await inspectExistingToken(tokenFile, fsImpl);
+    if (existing) await openVerifiedToken(tokenFile, existing, fsImpl);
 
     const suffix = randomBytes(12).toString('hex');
     temporaryFile = path.join(directory, `.${basename}.${process.pid}.${suffix}.tmp`);
@@ -198,18 +210,20 @@ export async function storeToken(tokenData, tokenFile = TOKEN_FILE, {
     await handle.writeFile(serialized, 'utf8');
     await handle.sync();
     await handle.chmod(0o600);
+    const temporaryStats = await handle.stat();
+    assertSecureFile(temporaryStats);
+    if ((temporaryStats.mode & 0o777) !== 0o600) {
+      throw storeError('The temporary credential permissions could not be secured.');
+    }
     await handle.close();
     handle = undefined;
 
     await fsImpl.rename(temporaryFile, tokenFile);
     renamed = true;
-    await fsImpl.chmod(tokenFile, 0o600);
-    const stored = await fsImpl.lstat(tokenFile);
-    assertSecureFile(stored);
-    if ((stored.mode & 0o777) !== 0o600) {
-      throw storeError('The credential file permissions could not be secured.');
-    }
-    await syncDirectory(directory, fsImpl);
+    // Rename is the commit point. A directory fsync failure makes crash
+    // durability uncertain, but must not be reported as if the old credential
+    // were still installed.
+    await syncDirectory(directory, fsImpl).catch(() => {});
   } catch (cause) {
     if (cause instanceof CredentialStoreError) throw cause;
     throw storeError('The credential could not be stored safely.', cause);
@@ -227,7 +241,8 @@ export async function clearStoredToken(tokenFile = TOKEN_FILE, { fsImpl = fs } =
     const stats = await lstatIfPresent(tokenFile, fsImpl);
     if (!stats) return;
     await secureDirectory(path.dirname(tokenFile), fsImpl);
-    await inspectExistingToken(tokenFile, fsImpl, { repairMode: true });
+    const secured = await inspectExistingToken(tokenFile, fsImpl);
+    await openVerifiedToken(tokenFile, secured, fsImpl);
     await fsImpl.unlink(tokenFile);
     await syncDirectory(path.dirname(tokenFile), fsImpl);
   } catch (cause) {
