@@ -276,14 +276,17 @@ describe('caller-owned acquireToken contract', () => {
     expect(JSON.stringify(events)).not.toContain('CALLER_OWNED');
   });
 
-  test('adds prompt=login only for explicit reauthentication', async () => {
+  test('every authorization URL requires an explicit IMS login', async () => {
     const forced = eventCollector({ completeWith: 'FORCED' });
     await acquireToken({ reauthenticate: true, openBrowser: false, onEvent: forced.onEvent });
-    expect(new URL(forced.events[0].url).searchParams.get('prompt')).toBe('login');
-
     const ordinary = eventCollector({ completeWith: 'ORDINARY' });
     await acquireToken({ openBrowser: false, onEvent: ordinary.onEvent });
-    expect(new URL(ordinary.events[0].url).searchParams.has('prompt')).toBe(false);
+
+    for (const { events } of [forced, ordinary]) {
+      const params = new URL(events[0].url).searchParams;
+      expect(params.get('prompt')).toBe('login');
+      expect(params.get('profile_filter')).toBe('false');
+    }
   });
 
   test('reauthenticating getValidToken bypasses a valid cache and atomically reaches persistence', async () => {
@@ -302,10 +305,12 @@ describe('caller-owned acquireToken contract', () => {
     );
   });
 
-  test('default browser acquisition does not add prompt=login', async () => {
+  test('default browser acquisition still requires an explicit IMS login', async () => {
     completeFromOpen('DEFAULT');
     await getValidToken({ log: () => {} });
-    expect(new URL(mockOpen.mock.calls[0][0]).searchParams.has('prompt')).toBe(false);
+    const params = new URL(mockOpen.mock.calls[0][0]).searchParams;
+    expect(params.get('prompt')).toBe('login');
+    expect(params.get('profile_filter')).toBe('false');
   });
 
   test.each(['3600', '300000', '1800000', '86400000'])(

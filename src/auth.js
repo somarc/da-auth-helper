@@ -584,7 +584,7 @@ function createCallbackAttempt({ expectedState, timeoutMs, signal, emit }) {
   };
 }
 
-function authorizationUrl({ state, reauthenticate }) {
+function authorizationUrl({ state }) {
   const params = new URLSearchParams({
     response_type: 'token',
     client_id: CLIENT_ID,
@@ -594,7 +594,6 @@ function authorizationUrl({ state, reauthenticate }) {
     profile_filter: false,
     state,
   });
-  if (reauthenticate) params.set('prompt', 'login');
   return `${IMS_ORIGIN}/ims/authorize/v2?${params}`;
 }
 
@@ -656,7 +655,7 @@ async function browserAttempt({
   guard,
 }) {
   const state = crypto.randomBytes(16).toString('hex');
-  const authUrl = authorizationUrl({ state, reauthenticate });
+  const authUrl = authorizationUrl({ state });
   const { deadlineAt } = guard;
   const attempt = createCallbackAttempt({
     expectedState: state,
@@ -757,7 +756,8 @@ async function emitCompleted(emit, result, guard) {
  * Acquires a fresh caller-owned token without reading or writing the helper cache.
  *
  * @param {object} [opts]
- * @param {boolean} [opts.reauthenticate=false] - Add IMS prompt=login.
+ * @param {boolean} [opts.reauthenticate=false] - Report the attempt as reauthentication in events.
+ *   Every attempt already sends IMS prompt=login.
  * @param {boolean} [opts.openBrowser=true] - Launch the OS browser when true.
  * @param {number} [opts.timeoutMs=300000] - Attempt timeout in milliseconds.
  * @param {AbortSignal} [opts.signal] - Cancels the active callback attempt.
@@ -785,7 +785,8 @@ export async function acquireToken(opts = {}) {
  * @param {object} [opts]
  * @param {string} [opts.override] - Hard-coded token; skips cache and browser flow.
  * @param {Function} [opts.log=console.info] - Human-readable status logger.
- * @param {boolean} [opts.reauthenticate=false] - Bypass cache and add prompt=login.
+ * @param {boolean} [opts.reauthenticate=false] - Bypass the cache. Every browser attempt
+ *   already sends IMS prompt=login.
  * @param {boolean} [opts.openBrowser=true] - Launch the OS browser when true.
  * @param {number} [opts.timeoutMs=300000] - Attempt timeout in milliseconds.
  * @param {AbortSignal} [opts.signal] - Cancels the active callback attempt.

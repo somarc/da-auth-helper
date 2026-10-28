@@ -49,7 +49,7 @@ To explicitly require a new IMS authentication round trip:
 const token = await getValidToken({ reauthenticate: true });
 ```
 
-`reauthenticate: true` bypasses the cache and adds `prompt=login` to the IMS request. It does **not** select or prove an Adobe account, IMS organization, DA organization, or repository authorization.
+`reauthenticate: true` bypasses the cache. Every browser attempt, with or without it, sends `prompt=login` and `profile_filter=false`, so IMS always shows its login screen instead of silently reusing an existing browser session. It does **not** select or prove an Adobe account, IMS organization, DA organization, or repository authorization.
 
 ### Caller-owned acquisition path
 
@@ -99,7 +99,7 @@ Result shape:
 |---|---|---:|---|
 | `override` | `string` | — | `getValidToken()` only: return an explicit caller token without cache or browser activity. |
 | `log` | `(message: string) => void` | `console.info` | `getValidToken()` human-readable status sink. It never receives the token. |
-| `reauthenticate` | `boolean` | `false` | Bypass the helper cache where applicable and add IMS `prompt=login`. |
+| `reauthenticate` | `boolean` | `false` | Bypass the helper cache where applicable. Every browser attempt already sends IMS `prompt=login`. |
 | `openBrowser` | `boolean` | `true` | Launch the operating-system browser. Set false for caller-owned browser handoff. |
 | `timeoutMs` | `number` | `300000` | Positive integer attempt deadline accepted by the Node.js timer API. |
 | `signal` | `AbortSignal` | — | Cancels the callback listener and active attempt. |
